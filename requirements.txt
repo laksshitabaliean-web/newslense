@@ -1,0 +1,7 @@
+streamlit
+ddgs
+newspaper3k
+textblob
+lxml_html_clean
+plotly
+wordcloud
