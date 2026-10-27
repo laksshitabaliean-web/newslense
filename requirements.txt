@@ -5,3 +5,4 @@ textblob
 lxml_html_clean
 plotly
 wordcloud
+supabase

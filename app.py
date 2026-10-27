@@ -35,6 +35,127 @@ CYAN = "#4fd8ff"
 PINK = "#ff3d8a"
 
 # ---------------------------------------------------------------------------
+# Auth (Supabase) -- real accounts so each person's search history is
+# private to them. Privacy is enforced by row-level security policies in
+# the database itself (set up via the SQL script), not just by hiding
+# things in the UI.
+# ---------------------------------------------------------------------------
+
+try:
+    from supabase import create_client
+
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "") if hasattr(st, "secrets") else ""
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "") if hasattr(st, "secrets") else ""
+
+
+def get_supabase_client():
+    """One client per browser session (st.session_state), never a single
+    shared global client -- sharing one instance across everyone using the
+    deployed app would leak one person's login into another person's
+    session."""
+    if "supabase_client" not in st.session_state:
+        st.session_state["supabase_client"] = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return st.session_state["supabase_client"]
+
+
+def sign_up(email, password):
+    return get_supabase_client().auth.sign_up({"email": email, "password": password})
+
+
+def sign_in(email, password):
+    return get_supabase_client().auth.sign_in_with_password({"email": email, "password": password})
+
+
+def sign_out():
+    try:
+        get_supabase_client().auth.sign_out()
+    except Exception:
+        pass
+    for key in ["supabase_client", "user", "last_results", "last_urls", "last_topic", "from_cache"]:
+        st.session_state.pop(key, None)
+
+
+def fetch_user_history(user_id, limit=10):
+    res = (
+        get_supabase_client()
+        .table("search_history")
+        .select("topic")
+        .eq("user_id", user_id)
+        .order("searched_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    seen = []
+    for row in res.data:
+        if row["topic"] not in seen:
+            seen.append(row["topic"])
+    return seen
+
+
+def log_search(user_id, topic):
+    try:
+        get_supabase_client().table("search_history").insert(
+            {"user_id": user_id, "topic": topic}
+        ).execute()
+    except Exception as e:
+        print(f"Could not log search history: {e}")
+
+
+def render_auth_gate():
+    """Shows login/signup forms and halts the rest of the app until
+    someone is signed in."""
+    st.markdown('<div class="nl-section-title">Sign in to NewsLense</div>', unsafe_allow_html=True)
+
+    if not SUPABASE_AVAILABLE or not SUPABASE_URL or not SUPABASE_KEY:
+        st.error(
+            "Accounts aren't configured yet. Add SUPABASE_URL and SUPABASE_KEY to "
+            "this app's secrets, and make sure the supabase package is installed."
+        )
+        st.stop()
+
+    tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
+
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Log in")
+        if submitted:
+            try:
+                response = sign_in(email, password)
+                if response.user:
+                    st.session_state["user"] = response.user
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Could not log in: {e}")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            new_email = st.text_input("Email", key="signup_email")
+            new_password = st.text_input("Password (at least 6 characters)", type="password", key="signup_password")
+            submitted_signup = st.form_submit_button("Sign up")
+        if submitted_signup:
+            try:
+                response = sign_up(new_email, new_password)
+                if response.session:
+                    st.session_state["user"] = response.user
+                    st.rerun()
+                else:
+                    st.success(
+                        "Account created. If email confirmation is required, "
+                        "confirm it from your inbox, then log in above."
+                    )
+            except Exception as e:
+                st.error(f"Could not sign up: {e}")
+
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
 # Global styling (CSS only -- safe inside st.markdown). Drifting background
 # blobs, card/chip entrance + hover motion, mobile breakpoint.
 # ---------------------------------------------------------------------------
@@ -369,22 +490,12 @@ def load_cache(topic):
     return None
 
 
-def list_cached_topics():
-    if not os.path.exists(CACHE_DIR):
-        return []
-    names = []
-    for fname in sorted(os.listdir(CACHE_DIR)):
-        if fname.endswith(".json"):
-            try:
-                with open(f"{CACHE_DIR}/{fname}") as f:
-                    names.append(json.load(f)["topic"])
-            except Exception:
-                pass
-    return names
-
-
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar -- shows who's signed in and, for them only, their own search
+# history (pulled from Supabase, scoped by row-level security to their
+# user id). The local `cache/` folder below is a separate, unrelated
+# thing: a topic-level speed cache shared by everyone, with no names or
+# accounts attached to it.
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
@@ -392,14 +503,31 @@ with st.sidebar:
         st.markdown('<div class="nl-logo-wrap">', unsafe_allow_html=True)
         st.image("logo.png", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown('<div class="nl-section-title">Recent topics</div>', unsafe_allow_html=True)
-    cached_topics = list_cached_topics()
-    if cached_topics:
-        for t in cached_topics:
-            if st.button(t, key=f"recent-{t}", use_container_width=True):
-                st.session_state["topic_input"] = t
+
+    current_user = st.session_state.get("user")
+    if current_user:
+        st.markdown(
+            f'<div class="nl-section-title">Signed in as {current_user.email}</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Log out", use_container_width=True):
+            sign_out()
+            st.rerun()
+
+        st.markdown('<div class="nl-section-title">Your recent searches</div>', unsafe_allow_html=True)
+        try:
+            history = fetch_user_history(current_user.id)
+        except Exception as e:
+            history = []
+            st.caption(f"Could not load your history: {e}")
+        if history:
+            for t in history:
+                if st.button(t, key=f"recent-{t}", use_container_width=True):
+                    st.session_state["topic_input"] = t
+        else:
+            st.caption("Nothing analyzed yet. Your searches will appear here.")
     else:
-        st.caption("Nothing analyzed yet. Your searches will appear here.")
+        st.caption("Sign in to save and see your own search history.")
 
 # ---------------------------------------------------------------------------
 # Header
@@ -415,12 +543,61 @@ with col_title:
     st.markdown('<p class="nl-title">NewsLense</p>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Input
+# Require sign-in before the actual tool is usable. Logo/title/hero above
+# this line stay visible to everyone as the public "what is this" intro.
 # ---------------------------------------------------------------------------
+
+if "user" not in st.session_state:
+    render_auth_gate()
+
+# ---------------------------------------------------------------------------
+# Input -- a small typewriter line cycles through example topics so the
+# box doesn't look empty/confusing, without pre-filling it with a real
+# value that looks like the only thing you're allowed to search.
+# ---------------------------------------------------------------------------
+
+SUGGESTIONS_HTML = """
+<div id="nl-suggest-root">
+  <style>
+    body { margin: 0; background: transparent; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+    .suggest-line { font-size: 0.88rem; color: #8a8a94; padding: 2px 0 2px 2px; }
+    .suggest-cursor { display: inline-block; width: 2px; background: #ff3d8a; margin-left: 2px; animation: sblink 0.8s step-end infinite; }
+    @keyframes sblink { 50% { opacity: 0; } }
+  </style>
+  <div class="suggest-line">Try: <span id="sg-text"></span><span class="suggest-cursor">&nbsp;</span></div>
+  <script>
+    const topics = [
+      "climate protest london",
+      "immigration policy",
+      "2026 elections",
+      "AI regulation",
+      "minimum wage increase"
+    ];
+    let ti = 0, ci = 0, del_ = false;
+    const el = document.getElementById("sg-text");
+    function tick() {
+      const current = topics[ti];
+      if (!del_) {
+        ci++;
+        el.textContent = current.slice(0, ci);
+        if (ci === current.length) { del_ = true; setTimeout(tick, 1300); return; }
+      } else {
+        ci--;
+        el.textContent = current.slice(0, ci);
+        if (ci === 0) { del_ = false; ti = (ti + 1) % topics.length; }
+      }
+      setTimeout(tick, del_ ? 22 : 34);
+    }
+    tick();
+  </script>
+</div>
+"""
+components.html(SUGGESTIONS_HTML, height=32, scrolling=False)
 
 topic = st.text_input(
     "Enter a news topic",
-    value=st.session_state.get("topic_input", "climate protest london"),
+    value=st.session_state.get("topic_input", ""),
+    placeholder="Type a news topic, e.g. climate protest, immigration policy...",
     key="topic_input",
 )
 
@@ -430,7 +607,9 @@ analyze_clicked = st.button("Analyze")
 # Run / load analysis
 # ---------------------------------------------------------------------------
 
-if analyze_clicked or "last_results" in st.session_state:
+if analyze_clicked and not topic.strip():
+    st.warning("Type a topic first.")
+elif analyze_clicked or "last_results" in st.session_state:
     if analyze_clicked:
         cached = load_cache(topic)
         if cached:
@@ -450,6 +629,10 @@ if analyze_clicked or "last_results" in st.session_state:
         st.session_state["last_results"] = results
         st.session_state["last_urls"] = found_urls
         st.session_state["last_topic"] = topic
+
+        signed_in_user = st.session_state.get("user")
+        if signed_in_user:
+            log_search(signed_in_user.id, topic)
     else:
         results = st.session_state["last_results"]
         found_urls = st.session_state["last_urls"]
